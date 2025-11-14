@@ -4,7 +4,6 @@ title: "When Legacy .NET Meets Azure Functions: Two Production Incidents and Wha
 permalink: /azure-functions-v1-ef6-incidents/
 ---
 
-
 We recently lifted an old .NET Framework + Entity Framework 6 codebase into an Azure Functions v1 app that listens to Service Bus messages and writes to SQL Server.
 
 On paper, the flow is straightforward:
@@ -110,7 +109,7 @@ After this:
 ### Diagram: what actually happens
 
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/whatactuallyhappens.svg" alt="Architecture Diagram" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/whatactuallyhappens.svg" alt="What Actually Happens Diagram" width="800"/>
 </div>
 
 ---
@@ -134,13 +133,13 @@ Digging through the inner exceptions:
 
 ```
 InnerException Level 2:
-The INSERT statement conflicted with the FOREIGN KEY constraint 'FK_ICubePayment_UserProfile'.
+The INSERT statement conflicted with the FOREIGN KEY constraint 'FK_Payment_UserProfile'.
 The conflict occurred in database '...', table 'dbo.UserProfiles', column 'UserId'.
 ```
 
 So EF was complaining about:
 - Concurrent operations on the same DbContext, and
-- Foreign key conflicts, where ICubePayment was pointing to a UserProfile that wasn't there (or not yet committed)
+- Foreign key conflicts, where a Payment record was pointing to a UserProfile that wasn't there (or not yet committed)
 
 Again, restarting the function app would make it disappear for a while, which initially reinforced our "host issue causes everything" narrative. But this was a separate bug.
 
@@ -151,24 +150,21 @@ Our legacy code had a static dependency container:
 ```csharp
 public static class DependencyContainer
 {
-    public static readonly BookingServicebusFunc BookingConsumer;
+    public static readonly MessageProcessor Processor;
 
     static DependencyContainer()
     {
-        var metadata = Environment.GetEnvironmentVariable("MetadataLocations");
-        var provider = Environment.GetEnvironmentVariable("SqlProviderConnectionString");
+        var connectionString = Environment.GetEnvironmentVariable("EntityFrameworkConnectionString");
+        var dbContext = new ApplicationDbContext(connectionString);
 
-        var efConn = $"metadata={metadata};provider=System.Data.SqlClient;provider connection string=\"{provider}\"";
-        var dbContext = new TVSModel(efConn);
+        var userRepo = new UserRepository(dbContext);
+        var orderRepo = new OrderRepository(dbContext);
+        // ... other repositories
 
-        var bookingDetailRepo = new BookingDetailRepository(dbContext);
-        var userProfileRepo = new UserProfileRepository(dbContext);
-        // ...
-
-        BookingConsumer = new BookingServicebusFunc(
+        Processor = new MessageProcessor(
             dbContext,
-            bookingDetailRepo,
-            userProfileRepo,
+            userRepo,
+            orderRepo
             // ...
         );
     }
@@ -178,23 +174,23 @@ public static class DependencyContainer
 The function used this like:
 
 ```csharp
-[FunctionName("ProcessBookingFunction")]
+[FunctionName("ProcessMessageFunction")]
 public static async Task Run(
-    [ServiceBusTrigger(...)] string mySbMsg,
+    [ServiceBusTrigger(...)] string message,
     TraceWriter log)
 {
-    var consumer = DependencyContainer.BookingConsumer;
-    var payloads = consumer.DeserializeBookingPayload(mySbMsg);
+    var processor = DependencyContainer.Processor;
+    var payloads = processor.DeserializeMessage(message);
 
     foreach (var payload in payloads)
     {
-        await consumer.ProcessOfflineBookingData(payload);
+        await processor.ProcessData(payload);
     }
 }
 ```
 
 So:
-- One static `TVSModel` DbContext created at startup
+- One static `ApplicationDbContext` created at startup
 - All Service Bus messages, across all function instances, shared that same context
 
 ### What we tried first (that didn't work)
@@ -203,7 +199,7 @@ Because the error text talks about async operations, we naturally went in that d
 - Converted repository methods to async/await
 - Switched to `SaveChangesAsync()` everywhere
 - Added checks and tried to make sure every EF call was awaited properly
-- Added more detailed status logging like `status:Mapped Payload` to see where it blew up
+- Added more detailed status logging to see where it blew up
 
 But even with everything awaited, the error kept coming back under load.
 
@@ -213,7 +209,7 @@ That's when we had to accept the more fundamental truth:
 > Even if every method is async/await, you cannot safely share one context instance across concurrent operations.
 
 In an Azure Functions app, multiple messages are processed in parallel. By sharing a static context, we had:
-- Message 1 querying and saving on the same TVSModel
+- Message 1 querying and saving on the same DbContext
 - Message 2 doing the same at the same time
 - EF's change tracker and connection state getting corrupted
 
@@ -222,9 +218,8 @@ In an Azure Functions app, multiple messages are processed in parallel. By shari
 ### Concurrency diagram
 
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/concurrency.svg" alt="Architecture Diagram" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/concurrency.svg" alt="Concurrency Diagram" width="800"/>
 </div>
-
 
 Restarting the function app happened to "reset" that shared context, so for a short time everything looked healthy again. That's why this bug and the host lock bug felt connected, even though they weren't.
 
@@ -242,50 +237,40 @@ public static class DependencyContainer
     static DependencyContainer()
     {
         System.Data.Entity.SqlServer.SqlProviderServices.Instance.GetType();
-        var metadata = Environment.GetEnvironmentVariable("MetadataLocations");
-        var provider = Environment.GetEnvironmentVariable("SqlProviderConnectionString");
-        _connectionString = $"metadata={metadata};provider=System.Data.SqlClient;provider connection string=\"{provider}\"";
+        _connectionString = Environment.GetEnvironmentVariable("EntityFrameworkConnectionString");
     }
 
-    public static BookingServicebusFunc CreateBookingConsumer()
+    public static MessageProcessor CreateProcessor()
     {
-        var dbContext = new TVSModel(_connectionString);
+        var dbContext = new ApplicationDbContext(_connectionString);
 
-        var bookingDetailRepo = new BookingDetailRepository(dbContext);
-        var userProfileRepo = new UserProfileRepository(dbContext);
-        var cityRepo = new CityRepository(dbContext);
-        var userConsentRepo = new UserConsentRepository(dbContext);
+        var userRepo = new UserRepository(dbContext);
+        var orderRepo = new OrderRepository(dbContext);
         var paymentRepo = new PaymentRepository(dbContext);
-        var paymentDetailRepo = new PaymentDetailRepository(dbContext);
-        var customerDetailsRepo = new CustomerDetailsRepository(dbContext, null, null, null, null, null, null, null);
-        var customerBookingPayment = new CustomerBookingPayment(dbContext, bookingDetailRepo, paymentRepo, paymentDetailRepo);
+        // ... other repositories
 
-        return new BookingServicebusFunc(
+        return new MessageProcessor(
             dbContext,
-            bookingDetailRepo,
-            userProfileRepo,
-            cityRepo,
-            userConsentRepo,
-            paymentRepo,
-            paymentDetailRepo,
-            customerDetailsRepo,
-            customerBookingPayment
+            userRepo,
+            orderRepo,
+            paymentRepo
+            // ...
         );
     }
 }
 ```
 
-#### 2. BookingServicebusFunc implements IDisposable
+#### 2. MessageProcessor implements IDisposable
 
 ```csharp
-public class BookingServicebusFunc : IDisposable
+public class MessageProcessor : IDisposable
 {
-    private readonly TVSModel _tvsDbContext;
+    private readonly ApplicationDbContext _dbContext;
     private bool _disposed;
 
-    public BookingServicebusFunc(TVSModel tvsDbContext, /* ... */)
+    public MessageProcessor(ApplicationDbContext dbContext, /* ... */)
     {
-        _tvsDbContext = tvsDbContext;
+        _dbContext = dbContext;
         // ...
     }
 
@@ -301,47 +286,47 @@ public class BookingServicebusFunc : IDisposable
         {
             if (disposing)
             {
-                _tvsDbContext?.Dispose();
+                _dbContext?.Dispose();
             }
             _disposed = true;
         }
     }
 
-    // all your async methods using _tvsDbContext...
+    // all your async methods using _dbContext...
 }
 ```
 
-#### 3. Function creates and disposes the consumer per trigger execution
+#### 3. Function creates and disposes the processor per trigger execution
 
 ```csharp
-[FunctionName("ProcessBookingFunction")]
+[FunctionName("ProcessMessageFunction")]
 public static async Task Run(
     [ServiceBusTrigger(
-        "%BookingServiceBusTopic%",
-        "%BookingServiceBusSubscriptionName%",
+        "%ServiceBusTopic%",
+        "%ServiceBusSubscription%",
         AccessRights.Listen,
-        Connection = "BookingServiceBusConnectionString"
-    )] string mySbMsg,
+        Connection = "ServiceBusConnectionString"
+    )] string message,
     TraceWriter log)
 {
-    log.Info($"📨 Received booking message: {mySbMsg}");
+    log.Info($"📨 Received message: {message}");
 
-    using (var consumer = DependencyContainer.CreateBookingConsumer())
+    using (var processor = DependencyContainer.CreateProcessor())
     {
         string status = "NotStarted";
-        var payloads = consumer.DeserializeBookingPayload(mySbMsg);
+        var payloads = processor.DeserializeMessage(message);
 
         foreach (var payload in payloads)
         {
             try
             {
-                var result = await consumer.ProcessOfflineBookingData(payload);
+                var result = await processor.ProcessData(payload);
                 status = result?.ToString() ?? "null";
-                log.Info($"Processed booking {payload.BookingUUID} with status: {status}");
+                log.Info($"Processed {payload.Id} with status: {status}");
             }
             catch (Exception ex)
             {
-                log.Error($"❌ Error processing booking {payload.BookingUUID} with status : {status}: {ex.Message}");
+                log.Error($"❌ Error processing {payload.Id} with status: {status}: {ex.Message}");
             }
         }
     }   // DbContext disposed here
@@ -365,7 +350,7 @@ After these changes:
 ## Putting both issues side by side
 
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/bothissue.svg" alt="Architecture Diagram" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/bothissue.svg" alt="Both Issues Side by Side" width="800"/>
 </div>
 
 You can see why it was easy to tie them together: in both cases "wait a day, then restart" looked like a fix. Under the hood though, they were two completely different problems.
