@@ -1,5 +1,8 @@
-When Legacy .NET Meets Azure Functions: Two Production Incidents and What They Taught Us
-
+---
+layout: post
+title: "When Legacy .NET Meets Azure Functions: Two Production Incidents and What They Taught Us"
+permalink: /azure-functions-v1-ef6-incidents/
+---
 We recently lifted an old .NET Framework + Entity Framework 6 codebase into an Azure Functions v1 app that listens to Service Bus messages and writes to SQL Server.
 
 On paper, the flow is straightforward:
