@@ -25,7 +25,7 @@ This post walks through the symptoms, false leads, the actual root causes, and t
 
 ## Architecture at a Glance
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/architecture-diagram.svg" alt="Architecture Diagram" width="800"/>
+  <img src="https://raw.githubusercontent.com/Rithik53/azure-functions-ef6-blog-/main/assets/images/architecture-diagram.svg" alt="Architecture Diagram" width="800"/>
 </div>
 
 ---
@@ -109,17 +109,9 @@ After this:
 
 ### Diagram: what actually happens
 
-**With Public Access Disabled:**
-```
-Azure Function Host → Storage Account
-                      ← 403 Forbidden (internal IP blocked)
-```
-
-**After 'Selected networks' + VNet:**
-```
-Azure Function Host → Storage Account
-                      ← 200 OK (lease acquired)
-```
+<div align="center">
+  <img src="{{ site.baseurl }}/assets/images/whatactuallyhappens.svg" alt="Architecture Diagram" width="800"/>
+</div>
 
 ---
 
@@ -229,13 +221,10 @@ In an Azure Functions app, multiple messages are processed in parallel. By shari
 
 ### Concurrency diagram
 
-```
-Function Instance (Msg #1) → Shared TVSModel (DbContext) → SQL DB
-                               ↑
-Function Instance (Msg #2) ────┘
-                              Exception - second operation on this context
-                              Context state now inconsistent
-```
+<div align="center">
+  <img src="{{ site.baseurl }}/assets/images/concurrency.svg" alt="Architecture Diagram" width="800"/>
+</div>
+
 
 Restarting the function app happened to "reset" that shared context, so for a short time everything looked healthy again. That's why this bug and the host lock bug felt connected, even though they weren't.
 
@@ -375,31 +364,9 @@ After these changes:
 
 ## Putting both issues side by side
 
-### Issue #1: Host Lock / Storage Networking
-```
-Public network access disabled
-    ↓
-Internal Azure IPs blocked
-    ↓
-403 on host lock lease
-    ↓
-Host becomes unhealthy after a day
-    ↓
-Manual restart "fixes" it temporarily
-```
-
-### Issue #2: EF Concurrency
-```
-Static shared DbContext
-    ↓
-Parallel message processing
-    ↓
-Second operation on this context
-    ↓
-FK conflicts & partial writes
-    ↓
-Manual restart resets context for a while
-```
+<div align="center">
+  <img src="{{ site.baseurl }}/assets/images/bothissue.svg" alt="Architecture Diagram" width="800"/>
+</div>
 
 You can see why it was easy to tie them together: in both cases "wait a day, then restart" looked like a fix. Under the hood though, they were two completely different problems.
 
