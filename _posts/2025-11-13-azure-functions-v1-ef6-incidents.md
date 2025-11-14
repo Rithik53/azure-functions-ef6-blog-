@@ -24,7 +24,7 @@ This post walks through the symptoms, false leads, the actual root causes, and t
 
 ## Architecture at a Glance
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/architecture-diagram.svg" alt="Architecture Diagram" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/architecture-diagram.svg" alt="Architecture Diagram" width="1200"/>
 </div>
 
 ---
@@ -109,7 +109,7 @@ After this:
 ### Diagram: what actually happens
 
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/whatactuallyhappens.svg" alt="What Actually Happens Diagram" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/whatactuallyhappens.svg" alt="What Actually Happens Diagram" width="1200"/>
 </div>
 
 ---
@@ -218,7 +218,7 @@ In an Azure Functions app, multiple messages are processed in parallel. By shari
 ### Concurrency diagram
 
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/concurrency.svg" alt="Concurrency Diagram" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/concurrency.svg" alt="Concurrency Diagram" width="1200"/>
 </div>
 
 Restarting the function app happened to "reset" that shared context, so for a short time everything looked healthy again. That's why this bug and the host lock bug felt connected, even though they weren't.
@@ -350,7 +350,7 @@ After these changes:
 ## Putting both issues side by side
 
 <div align="center">
-  <img src="{{ site.baseurl }}/assets/images/bothissue.svg" alt="Both Issues Side by Side" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/bothissue.svg" alt="Both Issues Side by Side" width="1200"/>
 </div>
 
 You can see why it was easy to tie them together: in both cases "wait a day, then restart" looked like a fix. Under the hood though, they were two completely different problems.
