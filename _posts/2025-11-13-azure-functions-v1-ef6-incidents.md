@@ -84,8 +84,8 @@ The answer, in short:
 - When you switch to "Selected networks" and add your VNet, Azure's internal plumbing is still allowed to talk to the storage account while you keep overall access locked down.
 
 Even though not every doc spells it out explicitly, the behaviour is consistent with the guidance in:
-- [Create a virtual network rule for Azure Storage](https://docs.microsoft.com/azure/storage/common/storage-network-security)
-- [Set the default public network access rule](https://docs.microsoft.com/azure/storage/common/storage-network-security)
+- [Create a virtual network rule for Azure Storage](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-virtual-networks?tabs=azure-portal)
+- [Set the default public network access rule](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-set-default-access?tabs=azure-portal)
 
 In our environment:
 - Storage account: Public network access disabled, locked to a private endpoint
@@ -364,8 +364,8 @@ You can see why it was easy to tie them together: in both cases "wait a day, the
 - When you lock down a storage account used by Functions, read the fine print on network rules.
 - Prefer **Selected networks + VNet rules** over a blanket "Disable Public Access" if the storage is backing Azure Functions.
 - Keep the docs handy:
-  - [Virtual network rules for Azure Storage](https://docs.microsoft.com/azure/storage/common/storage-network-security)
-  - [Default public network access rules](https://docs.microsoft.com/azure/storage/common/storage-network-security)
+  - [Virtual network rules for Azure Storage](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-virtual-networks?tabs=azure-portal)
+  - [Default public network access rules](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-set-default-access?tabs=azure-portal)
 
 ### 2. DbContext is a unit of work, not a singleton
 
