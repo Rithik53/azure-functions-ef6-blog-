@@ -3,16 +3,19 @@ layout: post
 title: "When Legacy .NET Meets Azure Functions: Two Production Incidents and What They Taught Us"
 permalink: /azure-functions-v1-ef6-incidents/
 ---
+
+
 We recently lifted an old .NET Framework + Entity Framework 6 codebase into an Azure Functions v1 app that listens to Service Bus messages and writes to SQL Server.
 
 On paper, the flow is straightforward:
-- New booking → Service Bus topic  
-- Azure Function picks up the message  
-- We map it, update user/profile/payment tables via EF, and emit telemetry to Application Insights  
+- New booking → Service Bus topic
+- Azure Function picks up the message
+- We map it, update user/profile/payment tables via EF, and emit telemetry to Application Insights
 
 In reality, we hit two very different issues that kept showing up in production:
-1. Host lock lease failures on the Function host  
-2. Entity Framework “A second operation started on this context…” errors under load  
+
+1. **Host lock lease failures** on the Function host
+2. **Entity Framework "A second operation started on this context…" errors** under load
 
 To make it more confusing, these two errors often showed up a day or two after a restart, so for a while we were convinced the host lock problem was causing the EF exceptions.
 
@@ -22,201 +25,411 @@ This post walks through the symptoms, false leads, the actual root causes, and t
 
 ## Architecture at a Glance
 
-```mermaid
-flowchart LR
-    A[External System] -->|Booking Message| B[Azure Service Bus Topic]
-    B --> C[Azure Function App (v1, .NET Framework)]
-    C -->|Host locks, logs| D[Storage Account (AzureWebJobsStorage)]
-    C -->|EF6 / ADO.NET| E[SQL Database]
-    C -->|Telemetry| F[Application Insights]
+```
+External System → Booking Message → Azure Service Bus Topic
+                                           ↓
+                                  Azure Function App
+                                  (v1, .NET Framework)
+                                     ↓    ↓    ↓
+                    Storage Account  SQL DB  Application Insights
+                    (Host locks)     (EF6)   (Telemetry)
 ```
 
 ---
 
-# Issue 1 – “Failed to acquire host lock lease (403 Forbidden)”
+## Issue 1 – "Failed to acquire host lock lease (403 Forbidden)"
 
-## Symptoms
+### Symptoms
 
-Every now and then we’d see the function app go into a bad state. In the Log stream, the host spammed messages like:
+Every now and then we'd see the function app go into a bad state. In the Log stream, the host spammed messages like:
 
 ```
 [Verbose] Host 'xxxx' failed to acquire host lock lease:
 Microsoft.WindowsAzure.Storage: The remote server returned an error: (403) Forbidden.
 Forbidden.
 Forbidden.
+...
 ```
 
-Restarting the Function App “fixed” it for a while. After 24–48 hours, the same pattern returned.
+Restarting the Function App "fixed" it for a while. After 24–48 hours, the same pattern returned.
 
 At the same time, we were tightening security on the storage account:
-- Public network access disabled  
-- Only private endpoints / VNet access  
+- Public network access disabled
+- Only private endpoints / VNet access
 
-Our app settings, connection strings, and keys were all correct. We’d also wired up managed identity and blob data contributor roles. Yet the host could not acquire the lease blob in `azure-webjobs-hosts/locks`.
+Our app settings, connection strings, and keys were all correct. We'd also wired up managed identity and blob data contributor roles. Yet the host could not acquire the lease blob in `azure-webjobs-hosts/locks`.
 
----
-
-## Why does the host need a blob lease?
+### Why does the host need a blob lease?
 
 Azure Functions uses a host lock (blob lease) in the storage account to coordinate:
+- Which host instance is "active" for timers/triggers
+- Scale controller coordination
+- Some internal runtime housekeeping
 
-- Which host instance is “active” for timers/triggers  
-- Scale controller coordination  
-- Internal runtime housekeeping  
+If the runtime can't read/write that blob, it can't safely start processing, and you'll see the "failed to acquire host lock lease" messages.
 
-If the runtime can’t read/write that blob, it can’t safely start processing, and you’ll see the “failed to acquire host lock lease” messages.
+### The trap: we thought this was causing everything
 
----
+Because the error only showed up after some time and restarting fixed things, it was very tempting to say:
 
-## The trap: we thought this was causing everything
+> "Okay, the host can't acquire the lock → that must be why EF is throwing errors too."
 
-Because the error only showed up after some time and restarting fixed things, it was tempting to say:
+So we got into a habit of restarting the function during off-hours as a band-aid, just to keep things running while we debugged. That bought us time but obviously wasn't a real fix.
 
-> “Okay, the host can’t acquire the lock → that must be why EF is throwing errors too.”
+### The real culprit: storage network rules + internal Azure IPs
 
-So we got into a habit of restarting the function during off-hours as a band-aid. That bought us time but wasn’t a real fix.
+During a long chat with Microsoft support, the key explanation was:
 
----
+> Azure Functions uses internal Azure IPs to access the storage account in addition to any traffic from your VNet. If you set Public network access = Disabled, some of those internal calls can be blocked by the storage firewall.
 
-## The real culprit: storage network rules + internal Azure IPs
+We asked the obvious follow-up:
 
-During a detailed session with Microsoft support, we learned:
+> "Are these Microsoft public IPs? Private IPs? And if they're internal, how does adding our VNet to 'Selected networks' help?"
 
-- Azure Functions uses internal Azure IPs to access the storage account.  
-- Setting **Public network access = Disabled** blocks some of those internal calls.  
-- Adding your VNet to “Selected networks” implicitly allows Azure internal infra paths.  
+The answer, in short:
+- These are **internal Azure IP ranges**, not your VNet's IPs.
+- When you set "Public network access = Disabled", you block those internal calls as well.
+- When you switch to "Selected networks" and add your VNet, Azure's internal plumbing is still allowed to talk to the storage account while you keep overall access locked down.
+
+Even though not every doc spells it out explicitly, the behaviour is consistent with the guidance in:
+- [Create a virtual network rule for Azure Storage](https://docs.microsoft.com/azure/storage/common/storage-network-security)
+- [Set the default public network access rule](https://docs.microsoft.com/azure/storage/common/storage-network-security)
+
+In our environment:
+- Storage account: Public network access disabled, locked to a private endpoint
+- Function App: integrated with a VNet
+- **Result**: some of the internal runtime calls from the Functions infrastructure to the storage account were returning 403 Forbidden, breaking the host lock lease.
 
 ### The fix
 
-We changed the storage networking mode to **Selected networks** and explicitly allowed the Function App VNet.
+We changed the storage network configuration to **Selected networks** and allowed the Function App's VNet:
+
+1. Storage Account → Networking
+2. Set **Public network access** to `Enabled from selected virtual networks and IP addresses`
+3. Add the same VNet/subnet used by the Function App
+4. Keep private endpoints as required
 
 After this:
+- The host lock lease warnings disappeared
+- The function app no longer went into that weird "unhealthy after a day" state
+- We stopped scheduling manual restarts just to keep the host alive
 
-- Host lock lease errors disappeared  
-- No more “unhealthy after a day” behaviour  
-- No more manual restarts  
+### Diagram: what actually happens
 
----
+**With Public Access Disabled:**
+```
+Azure Function Host → Storage Account
+                      ← 403 Forbidden (internal IP blocked)
+```
 
-## Diagram: what actually happens
-
-```mermaid
-sequenceDiagram
-    participant Func as Azure Function Host
-    participant SA as Storage Account
-    participant Infra as Azure Internal Infra
-
-    Note over Func,SA: With Public Access Disabled
-    Func->>SA: Acquire host lock lease (blob)
-    SA-->>Func: 403 Forbidden (internal IP blocked)
-
-    Note over Func,SA: After 'Selected networks' + VNet
-    Func->>SA: Acquire host lock lease
-    SA-->>Func: 200 OK (lease acquired)
+**After 'Selected networks' + VNet:**
+```
+Azure Function Host → Storage Account
+                      ← 200 OK (lease acquired)
 ```
 
 ---
 
-# Issue 2 – EF6 + Azure Functions = “A second operation started on this context…”
+## Issue 2 – EF6 + Azure Functions = "A second operation started on this context…"
 
-Once the host lock issue was fixed, the EF problem still persisted.
+Once the host was behaving, we still saw another problem inside our code, and for a while we blamed the host lock for this too.
 
-## The EF error
+### The EF error
+
+For some bookings the logs looked like this:
 
 ```
-A second operation started on this context before a previous asynchronous operation completed.
+status:Mapped Payload
+Error: A second operation started on this context before a previous asynchronous operation completed.
 Use 'await' to ensure that any asynchronous operations have completed before calling another method on this context.
 Any instance members are not guaranteed to be thread safe.
 ```
 
-Inner exception showed foreign key conflicts due to inconsistent state.
+Digging through the inner exceptions:
 
-Restarting the function cleared it temporarily, misleading us into thinking both issues were connected.
-
----
-
-## Root cause: one static DbContext shared across everything
-
-Legacy code created **one static DbContext** shared across all messages & executions.
-
-This led to:
-
-- Parallel operations corrupting EF change tracking  
-- “Second operation on this context” exceptions  
-- Rare FK conflicts  
-
-EF6 DbContext is **not thread-safe**. No amount of async/await fixes that.
-
----
-
-## Concurrency diagram
-
-```mermaid
-sequenceDiagram
-    participant M1 as Function (Msg #1)
-    participant M2 as Function (Msg #2)
-    participant DC as Shared DbContext
-    participant SQL as SQL DB
-
-    M1->>DC: SaveChangesAsync (insert user)
-    M2->>DC: SaveChangesAsync (insert payment)
-    DC-->>M2: Exception - second operation
-    DC-->>M1: Context state corrupted
+```
+InnerException Level 2:
+The INSERT statement conflicted with the FOREIGN KEY constraint 'FK_ICubePayment_UserProfile'.
+The conflict occurred in database '...', table 'dbo.UserProfiles', column 'UserId'.
 ```
 
----
+So EF was complaining about:
+- Concurrent operations on the same DbContext, and
+- Foreign key conflicts, where ICubePayment was pointing to a UserProfile that wasn't there (or not yet committed)
 
-## The fix – one DbContext per message, properly disposed
+Again, restarting the function app would make it disappear for a while, which initially reinforced our "host issue causes everything" narrative. But this was a separate bug.
 
-### 1. Container returns a fresh DbContext per call  
-### 2. BookingServicebusFunc implements IDisposable  
-### 3. Function creates and disposes context with `using`  
-### 4. Added EF clean-ups such as AsNoTracking  
+### The original design: one static DbContext for everything
 
-After the change:
+Our legacy code had a static dependency container:
 
-- No more concurrency errors  
-- No more FK conflicts  
-- No more restart hacks  
+```csharp
+public static class DependencyContainer
+{
+    public static readonly BookingServicebusFunc BookingConsumer;
 
----
+    static DependencyContainer()
+    {
+        var metadata = Environment.GetEnvironmentVariable("MetadataLocations");
+        var provider = Environment.GetEnvironmentVariable("SqlProviderConnectionString");
 
-# Putting both issues side by side
+        var efConn = $"metadata={metadata};provider=System.Data.SqlClient;provider connection string=\"{provider}\"";
+        var dbContext = new TVSModel(efConn);
 
-```mermaid
-flowchart TB
-    subgraph Issue1[Issue #1: Host Lock / Storage Networking]
-      I1A[Public network access disabled] --> I1B[Internal Azure IPs blocked]
-      I1B --> I1C[403 on host lock lease]
-      I1C --> I1D[Host unhealthy after a day]
-      I1D --> I1E[Manual restart "fixes" temporarily]
-    end
+        var bookingDetailRepo = new BookingDetailRepository(dbContext);
+        var userProfileRepo = new UserProfileRepository(dbContext);
+        // ...
 
-    subgraph Issue2[Issue #2: EF Concurrency]
-      I2A[Static shared DbContext] --> I2B[Parallel message processing]
-      I2B --> I2C[Second operation on same context]
-      I2C --> I2D[FK conflicts & partial writes]
-      I2D --> I2E[Manual restart resets context]
-    end
+        BookingConsumer = new BookingServicebusFunc(
+            dbContext,
+            bookingDetailRepo,
+            userProfileRepo,
+            // ...
+        );
+    }
+}
 ```
 
+The function used this like:
+
+```csharp
+[FunctionName("ProcessBookingFunction")]
+public static async Task Run(
+    [ServiceBusTrigger(...)] string mySbMsg,
+    TraceWriter log)
+{
+    var consumer = DependencyContainer.BookingConsumer;
+    var payloads = consumer.DeserializeBookingPayload(mySbMsg);
+
+    foreach (var payload in payloads)
+    {
+        await consumer.ProcessOfflineBookingData(payload);
+    }
+}
+```
+
+So:
+- One static `TVSModel` DbContext created at startup
+- All Service Bus messages, across all function instances, shared that same context
+
+### What we tried first (that didn't work)
+
+Because the error text talks about async operations, we naturally went in that direction:
+- Converted repository methods to async/await
+- Switched to `SaveChangesAsync()` everywhere
+- Added checks and tried to make sure every EF call was awaited properly
+- Added more detailed status logging like `status:Mapped Payload` to see where it blew up
+
+But even with everything awaited, the error kept coming back under load.
+
+That's when we had to accept the more fundamental truth:
+
+> **Entity Framework 6 DbContext is not thread-safe.**  
+> Even if every method is async/await, you cannot safely share one context instance across concurrent operations.
+
+In an Azure Functions app, multiple messages are processed in parallel. By sharing a static context, we had:
+- Message 1 querying and saving on the same TVSModel
+- Message 2 doing the same at the same time
+- EF's change tracker and connection state getting corrupted
+
+**Result**: "second operation started on this context" and FK conflicts.
+
+### Concurrency diagram
+
+```
+Function Instance (Msg #1) → Shared TVSModel (DbContext) → SQL DB
+                               ↑
+Function Instance (Msg #2) ────┘
+                              Exception - second operation on this context
+                              Context state now inconsistent
+```
+
+Restarting the function app happened to "reset" that shared context, so for a short time everything looked healthy again. That's why this bug and the host lock bug felt connected, even though they weren't.
+
+### The fix – one DbContext per message, properly disposed
+
+Once we stopped fighting EF and accepted that the context lifetime was wrong, the solution became obvious.
+
+#### 1. The container now creates a fresh DbContext per call
+
+```csharp
+public static class DependencyContainer
+{
+    private static readonly string _connectionString;
+
+    static DependencyContainer()
+    {
+        System.Data.Entity.SqlServer.SqlProviderServices.Instance.GetType();
+        var metadata = Environment.GetEnvironmentVariable("MetadataLocations");
+        var provider = Environment.GetEnvironmentVariable("SqlProviderConnectionString");
+        _connectionString = $"metadata={metadata};provider=System.Data.SqlClient;provider connection string=\"{provider}\"";
+    }
+
+    public static BookingServicebusFunc CreateBookingConsumer()
+    {
+        var dbContext = new TVSModel(_connectionString);
+
+        var bookingDetailRepo = new BookingDetailRepository(dbContext);
+        var userProfileRepo = new UserProfileRepository(dbContext);
+        var cityRepo = new CityRepository(dbContext);
+        var userConsentRepo = new UserConsentRepository(dbContext);
+        var paymentRepo = new PaymentRepository(dbContext);
+        var paymentDetailRepo = new PaymentDetailRepository(dbContext);
+        var customerDetailsRepo = new CustomerDetailsRepository(dbContext, null, null, null, null, null, null, null);
+        var customerBookingPayment = new CustomerBookingPayment(dbContext, bookingDetailRepo, paymentRepo, paymentDetailRepo);
+
+        return new BookingServicebusFunc(
+            dbContext,
+            bookingDetailRepo,
+            userProfileRepo,
+            cityRepo,
+            userConsentRepo,
+            paymentRepo,
+            paymentDetailRepo,
+            customerDetailsRepo,
+            customerBookingPayment
+        );
+    }
+}
+```
+
+#### 2. BookingServicebusFunc implements IDisposable
+
+```csharp
+public class BookingServicebusFunc : IDisposable
+{
+    private readonly TVSModel _tvsDbContext;
+    private bool _disposed;
+
+    public BookingServicebusFunc(TVSModel tvsDbContext, /* ... */)
+    {
+        _tvsDbContext = tvsDbContext;
+        // ...
+    }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!_disposed)
+        {
+            if (disposing)
+            {
+                _tvsDbContext?.Dispose();
+            }
+            _disposed = true;
+        }
+    }
+
+    // all your async methods using _tvsDbContext...
+}
+```
+
+#### 3. Function creates and disposes the consumer per trigger execution
+
+```csharp
+[FunctionName("ProcessBookingFunction")]
+public static async Task Run(
+    [ServiceBusTrigger(
+        "%BookingServiceBusTopic%",
+        "%BookingServiceBusSubscriptionName%",
+        AccessRights.Listen,
+        Connection = "BookingServiceBusConnectionString"
+    )] string mySbMsg,
+    TraceWriter log)
+{
+    log.Info($"📨 Received booking message: {mySbMsg}");
+
+    using (var consumer = DependencyContainer.CreateBookingConsumer())
+    {
+        string status = "NotStarted";
+        var payloads = consumer.DeserializeBookingPayload(mySbMsg);
+
+        foreach (var payload in payloads)
+        {
+            try
+            {
+                var result = await consumer.ProcessOfflineBookingData(payload);
+                status = result?.ToString() ?? "null";
+                log.Info($"Processed booking {payload.BookingUUID} with status: {status}");
+            }
+            catch (Exception ex)
+            {
+                log.Error($"❌ Error processing booking {payload.BookingUUID} with status : {status}: {ex.Message}");
+            }
+        }
+    }   // DbContext disposed here
+}
+```
+
+#### 4. Some small EF clean-ups
+
+While we were in there, we also:
+- Added `AsNoTracking()` to read-only queries
+- Removed a few unnecessary `Reload()` calls
+- Improved error logging (printing inner exceptions and status at each step)
+
+After these changes:
+- The "second operation started on this context" error stopped completely
+- The FK conflicts vanished
+- We could remove the off-hours restart hack entirely
+
 ---
 
-# Lessons we’re taking forward
+## Putting both issues side by side
 
-### 1. Storage networking matters  
-- Prefer **Selected networks** over hard disabling public access.  
-- Azure Functions runtime itself needs access paths to storage.  
+### Issue #1: Host Lock / Storage Networking
+```
+Public network access disabled
+    ↓
+Internal Azure IPs blocked
+    ↓
+403 on host lock lease
+    ↓
+Host becomes unhealthy after a day
+    ↓
+Manual restart "fixes" it temporarily
+```
 
-### 2. DbContext is a unit of work  
-- Never treat EF6 DbContext as a singleton.  
-- Create one per message and dispose it.  
+### Issue #2: EF Concurrency
+```
+Static shared DbContext
+    ↓
+Parallel message processing
+    ↓
+Second operation on this context
+    ↓
+FK conflicts & partial writes
+    ↓
+Manual restart resets context for a while
+```
 
-### 3. Beware restart-driven debugging  
-- If restarts fix something temporarily, you probably have:
-  - a lifetime leak, or  
-  - a platform/network configuration issue.  
+You can see why it was easy to tie them together: in both cases "wait a day, then restart" looked like a fix. Under the hood though, they were two completely different problems.
 
 ---
 
+## Lessons we're taking forward
 
+### 1. Storage networking matters for the runtime itself, not just your code
+
+- When you lock down a storage account used by Functions, read the fine print on network rules.
+- Prefer **Selected networks + VNet rules** over a blanket "Disable Public Access" if the storage is backing Azure Functions.
+- Keep the docs handy:
+  - [Virtual network rules for Azure Storage](https://docs.microsoft.com/azure/storage/common/storage-network-security)
+  - [Default public network access rules](https://docs.microsoft.com/azure/storage/common/storage-network-security)
+
+### 2. DbContext is a unit of work, not a singleton
+
+- EF6 DbContext is not thread-safe, no matter how async/await you make your code.
+- In Azure Functions, treat each trigger execution like a web request: create a fresh context and dispose it.
+
+### 3. Beware of "restart-driven debugging"
+
+- If something always breaks after N hours/days and restarting fixes it briefly, that usually means you have:
+  - a **lifetime leak** (shared state, static context, stale connections), or
+  - a **platform-level configuration** like the storage networking issue.
+- Use restarts to buy time, but don't let them become the "solution".
