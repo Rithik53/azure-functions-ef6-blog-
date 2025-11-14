@@ -1,9 +1,9 @@
 title: Azure Functions v1 + EF6 Incidents
-description: Debugging host lock leases and EF concurrency in Azure Functions v1
+description: Debugging host lock leases and EF6 concurrency issues in Azure Functions v1
 theme: minima
 
-# If this is a project site, set the baseurl (repo name with leading slash)
-# If your site is at https://username.github.io/azure-functions-ef6-blog/
-baseurl: "/azure-functions-ef6-blog"
+# main site url (no trailing slash)
+url: "https://rithik53.github.io"
 
-# If it's a user site (username.github.io), comment baseurl out.
+# since repo is `azure-functions-ef6-blog-`
+baseurl: "/azure-functions-ef6-blog-"
