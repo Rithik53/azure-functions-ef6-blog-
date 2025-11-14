@@ -26,7 +26,7 @@ This post walks through the symptoms, false leads, the actual root causes, and t
 ## Architecture at a Glance
 <div align="center">
 
-![Architecture Diagram](./architecture-diagram.svg)
+![Architecture Diagram]({{ site.baseurl }}/assets/images/architecture-diagram.svg)
 
 </div>
 
