@@ -12,4 +12,4 @@ Welcome! This is a deep-dive into two real-world incidents:
 
 👉 Read the full post here:
 
-- [When Legacy .NET Meets Azure Functions: Two Production Incidents and What They Taught Us](/azure-functions-ef6-blog/azure-functions-v1-ef6-incidents/)
+- [When Legacy .NET Meets Azure Functions: Two Production Incidents and What They Taught Us]({{ "/azure-functions-v1-ef6-incidents/" | relative_url }})
