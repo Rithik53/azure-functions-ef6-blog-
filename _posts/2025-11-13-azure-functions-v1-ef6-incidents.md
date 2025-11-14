@@ -25,7 +25,7 @@ This post walks through the symptoms, false leads, the actual root causes, and t
 
 ## Architecture at a Glance
 <div align="center">
-  <img src="https://raw.githubusercontent.com/Rithik53/azure-functions-ef6-blog-/main/assets/images/architecture-diagram.svg" alt="Architecture Diagram" width="800"/>
+  <img src="{{ site.baseurl }}/assets/images/architecture-diagram.svg" alt="Architecture Diagram" width="800"/>
 </div>
 
 ---
